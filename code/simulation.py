@@ -108,7 +108,10 @@ def run_simulation(nphoton=1e7, geometry='realistic', unitinmm=0.5, dry_run=Fals
         'srctype': 'pencil',
         'detpos': detpos,
         'issavedet': 1,
-        'savedetflag': 'dp', # Save detector ID ('d') and partial pathlength ('p')
+        # Save detector ID ('d'), partial pathlength ('p') AND momentum transfer ('m').
+        # Momentum transfer Y is required by Wu et al. Eq.(5); ismomentum=1 also appends 'M'.
+        'savedetflag': 'dpm',
+        'ismomentum': 1,
         'maxdetphoton': 5000000,
         'unitinmm': unitinmm,
         'tstart': 0.0,
@@ -117,38 +120,71 @@ def run_simulation(nphoton=1e7, geometry='realistic', unitinmm=0.5, dry_run=Fals
         'bc': 'aaaaaa', # Absorbing boundary conditions on all sides
     }
     
+    # --- Reproducibility record (Action Item 5): dump the exact MCX configuration ---
+    print("\n================== MCX Configuration ==================")
+    print(f"  geometry      : {geometry}")
+    print(f"  voxel shape   : {vol.shape}  (unitinmm={unitinmm} mm)")
+    print(f"  media (prop)  : mua, mus, g, n")
+    for i, p in enumerate(prop):
+        print(f"    [{i}] {p}")
+    print(f"  srcpos (vox)  : {srcpos}   srcdir: {cfg['srcdir']}   srctype: {cfg['srctype']}")
+    print(f"  detpos (vox)  : {detpos}   (SDS = 1, 2, 3 cm)")
+    print(f"  nphoton       : {int(nphoton):.1e}")
+    print(f"  savedetflag   : {cfg['savedetflag']}   ismomentum: {cfg['ismomentum']}")
+    print(f"  bc            : {cfg['bc']}")
+    print("======================================================\n")
+
     if dry_run:
         print("Dry run requested. Configuration is correct and pmcx check passed.")
         return None
-        
+
     print(f"Launching simulation with {nphoton:.1e} photons on GPU...")
     res = pmcx.mcxlab(cfg)
     print("Simulation finished.")
     print(f"Runtime: {res['stat']['runtime']} ms")
-    
+
     detp = res['detp']
     detid = detp['detid']
     ppath = detp['ppath'] # Shape: (N_detected_photons, N_media)
-    
-    # Process pathlengths
+
+    # Verify momentum transfer is present (mirrors pmcx's own check in utils.py mcxdcsg1).
+    if 'mom' not in detp:
+        raise RuntimeError(
+            "Momentum transfer ('mom') missing from MCX output. "
+            "Ensure cfg['ismomentum']=1 and savedetflag contains 'm'."
+        )
+    mom = detp['mom']  # Shape: (N_detected_photons, N_media), cumulative Sum(1-cos_theta) per medium
+    print(f"Momentum transfer present: mom shape {mom.shape}")
+
+    # pmcx ppath/mom columns are 0-indexed by medium label MINUS ONE (NO background column):
+    #   col0 = medium 1 (shallow), col1 = medium 2 (deep), col2 = mylar, col3 = acrylic.
+    # (Verified empirically: col0 ~100% nonzero, col1 partial, cols 2-3 zero in simplified geom.)
+    # Process pathlengths (mm) and momentum transfer (dimensionless -> NO unitinmm scaling).
+    SHALLOW, DEEP = 0, 1
     processed_paths = {}
     for det_idx in range(1, len(detpos) + 1):
         idx = (detid == det_idx)
-        # Extract pathlengths in Shallow (index 1) and Deep (index 2) layers
-        # Convert pathlengths from grid units to millimeters
-        Ls = ppath[idx, 1] * unitinmm
-        Ld = ppath[idx, 2] * unitinmm
-        
-        print(f"Detector {det_idx} (SDS {det_idx} cm) captured {len(Ls)} photons.")
+        # Pathlengths in Shallow / Deep layers, converted grid units -> mm
+        Ls = ppath[idx, SHALLOW] * unitinmm
+        Ld = ppath[idx, DEEP] * unitinmm
+        # Momentum transfer per layer (Wu et al. Eq.5 Y term); no unit scaling
+        Ys = mom[idx, SHALLOW]
+        Yd = mom[idx, DEEP]
+
+        print(f"Detector {det_idx} (SDS {det_idx} cm) captured {len(Ls)} photons. "
+              f"mean Ls={Ls.mean():.2f}mm Ld={Ld.mean():.2f}mm Ys={Ys.mean():.3f} Yd={Yd.mean():.3f}"
+              if len(Ls) else f"Detector {det_idx} captured 0 photons.")
         processed_paths[f'det_{det_idx}_Ls'] = Ls.astype(np.float32)
         processed_paths[f'det_{det_idx}_Ld'] = Ld.astype(np.float32)
-        
+        processed_paths[f'det_{det_idx}_Ys'] = Ys.astype(np.float32)
+        processed_paths[f'det_{det_idx}_Yd'] = Yd.astype(np.float32)
+
     return processed_paths
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run DCS Monte Carlo simulation using PMCX")
     parser.add_argument('--nphoton', type=float, default=1e7, help="Number of photons to simulate")
-    parser.add_argument('--geometry', type=str, default='realistic', choices=['simplified', 'realistic'], help="Geometry type")
+    parser.add_argument('--geometry', type=str, default='simplified', choices=['simplified', 'realistic'], help="Geometry type (simplified slab avoids the over-thick Mylar barrier; see workflow.md)")
     parser.add_argument('--output', type=str, default='data/pathlengths.npz', help="Output file path")
     parser.add_argument('--dry-run', action='store_true', help="Check parameters without running simulation")
     
